@@ -18,9 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"strings"
-
 	"github.com/goharbor/harbor/src/common"
 	"github.com/goharbor/harbor/src/common/models"
 	"github.com/goharbor/harbor/src/common/utils"
@@ -30,12 +27,12 @@ import (
 	"github.com/goharbor/harbor/src/lib/errors"
 	"github.com/goharbor/harbor/src/lib/log"
 	"github.com/goharbor/harbor/src/pkg/oidc"
+	"net/http"
 )
 
 const tokenKey = "oidc_token"
 const stateKey = "oidc_state"
 const userInfoKey = "oidc_user_info"
-const oidcUserComment = "Onboarded via OIDC provider"
 
 // OIDCController handles requests for OIDC login, callback and user onboard
 type OIDCController struct {
@@ -118,10 +115,7 @@ func (oc *OIDCController) Callback() {
 	oc.SetSession(tokenKey, tokenBytes)
 	u, err := ctluser.Ctl.GetBySubIss(ctx, info.Subject, info.Issuer)
 	if errors.IsNotFoundErr(err) { // User is not onboarded, kickoff the onboard flow
-		// Recover the username from d.Username by default
-		username := info.Username
-		// Fix blanks in username
-		username = strings.Replace(username, " ", "_", -1)
+		username := oidc.GetSanitizedUserName(info)
 		oidcSettings, err := config.OIDCSetting(ctx)
 		if err != nil {
 			oc.SendInternalServerError(err)
@@ -158,19 +152,20 @@ func (oc *OIDCController) Callback() {
 		oc.SendError(err)
 		return
 	}
-	_, t, err := secretAndToken(tokenBytes)
+	_, t, err := oidc.SecretAndToken(tokenBytes)
 	oidcUser := um.OIDCUserMeta
 	oidcUser.Token = t
 	if err := ctluser.Ctl.UpdateOIDCMeta(ctx, oidcUser); err != nil {
 		oc.SendError(err)
 		return
 	}
+
 	oc.PopulateUserSession(*u)
 	oc.Controller.Redirect("/", http.StatusFound)
 }
 
 func userOnboard(ctx context.Context, oc *OIDCController, info *oidc.UserInfo, username string, tokenBytes []byte) (*models.User, bool) {
-	s, t, err := secretAndToken(tokenBytes)
+	s, t, err := oidc.SecretAndToken(tokenBytes)
 	if err != nil {
 		oc.SendInternalServerError(err)
 		return nil, false
@@ -186,7 +181,7 @@ func userOnboard(ctx context.Context, oc *OIDCController, info *oidc.UserInfo, u
 		Realname:     username,
 		Email:        info.Email,
 		OIDCUserMeta: &oidcUser,
-		Comment:      oidcUserComment,
+		Comment:      oidc.OidcUserComment,
 	}
 	oidc.InjectGroupsToUser(info, user)
 
@@ -242,21 +237,4 @@ func (oc *OIDCController) Onboard() {
 		oc.PopulateUserSession(*user)
 	}
 
-}
-
-func secretAndToken(tokenBytes []byte) (string, string, error) {
-	key, err := config.SecretKey()
-	if err != nil {
-		return "", "", err
-	}
-	token, err := utils.ReversibleEncrypt((string)(tokenBytes), key)
-	if err != nil {
-		return "", "", err
-	}
-	str := utils.GenerateRandomString()
-	secret, err := utils.ReversibleEncrypt(str, key)
-	if err != nil {
-		return "", "", err
-	}
-	return secret, token, nil
 }

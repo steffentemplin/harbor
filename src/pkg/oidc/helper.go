@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/goharbor/harbor/src/common/utils"
 	"net/http"
 	"strings"
 	"sync"
@@ -39,7 +40,8 @@ import (
 )
 
 const (
-	googleEndpoint = "https://accounts.google.com"
+	googleEndpoint  = "https://accounts.google.com"
+	OidcUserComment = "Onboarded via OIDC provider"
 )
 
 type claimsProvider interface {
@@ -262,7 +264,7 @@ func UserInfoFromToken(ctx context.Context, token *Token) (*UserInfo, error) {
 		return nil, err
 	}
 	setting := provider.setting.Load().(cfgModels.OIDCSetting)
-	local, err := UserInfoFromIDToken(ctx, token, setting)
+	local, err := userInfoFromIDToken(ctx, token, setting)
 	if err != nil {
 		return nil, err
 	}
@@ -333,8 +335,29 @@ func userInfoFromRemote(ctx context.Context, token *Token, setting cfgModels.OID
 // UserInfoFromIDToken extract user info from ID token
 func UserInfoFromIDToken(ctx context.Context, token *Token, setting cfgModels.OIDCSetting) (*UserInfo, error) {
 	if token.RawIDToken == "" {
+		return nil, errors.New("RawIDToken is empty, unable to get user info")
+	}
+
+	u, err := userInfoFromIDToken(ctx, token, setting)
+	if err != nil {
+		return nil, err
+	}
+
+	// priority for username in ID token (high to low):
+	// 1. Username based on the auto onboard claim from ID token
+	// 2. Username from the default "name" claim from ID token
+	if u.autoOnboardUsername != "" {
+		u.Username = u.autoOnboardUsername
+	}
+
+	return u, nil
+}
+
+func userInfoFromIDToken(ctx context.Context, token *Token, setting cfgModels.OIDCSetting) (*UserInfo, error) {
+	if token.RawIDToken == "" {
 		return nil, nil
 	}
+
 	idt, err := parseIDToken(ctx, token.RawIDToken)
 	if err != nil {
 		return nil, err
@@ -440,4 +463,32 @@ func TestEndpoint(conn Conn) error {
 	ctx := clientCtx(context.Background(), conn.VerifyCert)
 	_, err := gooidc.NewProvider(ctx, conn.URL)
 	return err
+}
+
+// SecretAndToken generates a new OIDC CLI secret and returns it along
+// with the reversibly encrypted token that is passed
+func SecretAndToken(tokenBytes []byte) (string, string, error) {
+	key, err := config.SecretKey()
+	if err != nil {
+		return "", "", err
+	}
+	token, err := utils.ReversibleEncrypt((string)(tokenBytes), key)
+	if err != nil {
+		return "", "", err
+	}
+	str := utils.GenerateRandomString()
+	secret, err := utils.ReversibleEncrypt(str, key)
+	if err != nil {
+		return "", "", err
+	}
+	return secret, token, nil
+}
+
+// GetSanitizedUserName replaces illegal characters of info.Username and returns
+// the sanitized string
+func GetSanitizedUserName(info *UserInfo) string {
+	username := info.Username
+	// Fix blanks in username
+	username = strings.Replace(username, " ", "_", -1)
+	return username
 }
