@@ -15,6 +15,12 @@
 package security
 
 import (
+	"encoding/json"
+	"fmt"
+	"github.com/goharbor/harbor/src/common/models"
+	"github.com/goharbor/harbor/src/core/auth"
+	cfgModels "github.com/goharbor/harbor/src/lib/config/models"
+	"github.com/goharbor/harbor/src/lib/errors"
 	"net/http"
 	"strings"
 
@@ -39,6 +45,7 @@ func (i *idToken) Generate(req *http.Request) security.Context {
 	if !strings.HasPrefix(req.URL.Path, "/api") {
 		return nil
 	}
+
 	token := bearerToken(req)
 	if len(token) == 0 {
 		return nil
@@ -46,11 +53,6 @@ func (i *idToken) Generate(req *http.Request) security.Context {
 	claims, err := oidc.VerifyToken(ctx, token)
 	if err != nil {
 		log.Warningf("failed to verify token: %v", err)
-		return nil
-	}
-	u, err := user.Ctl.GetBySubIss(ctx, claims.Subject, claims.Issuer)
-	if err != nil {
-		log.Warningf("failed to get user based on token claims: %v", err)
 		return nil
 	}
 	setting, err := config.OIDCSetting(ctx)
@@ -63,7 +65,67 @@ func (i *idToken) Generate(req *http.Request) security.Context {
 		log.Errorf("Failed to get user info from ID token: %v", err)
 		return nil
 	}
+
+	u, err := user.Ctl.GetBySubIss(ctx, claims.Subject, claims.Issuer)
+	if errors.IsNotFoundErr(err) {
+		if !setting.AutoOnboard {
+			log.Debugf("skipping disabled auto-onboarding for OIDC user %s", info.Username)
+			return nil
+		}
+
+		u, err = autoOnboard(req, setting, info, token)
+		if err != nil {
+			log.Warningf("failed to auto-onboard OIDC user with subject %s: %v", info.Subject, err)
+			return nil
+		}
+	} else if err != nil {
+		log.Warningf("failed to get user based on token claims: %v", err)
+		return nil
+	}
+
 	oidc.InjectGroupsToUser(info, u)
 	log.Debugf("an ID token security context generated for request %s %s", req.Method, req.URL.Path)
 	return local.NewSecurityContext(u)
+}
+
+func autoOnboard(req *http.Request, setting *cfgModels.OIDCSetting, info *oidc.UserInfo, idToken string) (*models.User, error) {
+	username := oidc.GetSanitizedUserName(info)
+	if username == "" {
+		return nil, fmt.Errorf("unable to recover username for auto onboard, username claim: %s", setting.UserClaim)
+	}
+
+	log.Infof("starting auto-onboarding for new OIDC user %s for valid ID token", username)
+
+	token := &oidc.Token{RawIDToken: idToken}
+	tokenBytes, err := json.Marshal(token)
+	if err != nil {
+		return nil, fmt.Errorf("unable to marshal ID token for user: %s", username)
+	}
+
+	s, t, err := oidc.SecretAndToken(tokenBytes)
+	if err != nil {
+		return nil, fmt.Errorf("unable to encrypt secret and token for: %s", username)
+	}
+
+	oidcUser := models.OIDCUser{
+		SubIss: info.Subject + info.Issuer,
+		Secret: s,
+		Token:  t,
+	}
+
+	user := &models.User{
+		Username:     username,
+		Realname:     username,
+		Email:        info.Email,
+		OIDCUserMeta: &oidcUser,
+		Comment:      oidc.OidcUserComment,
+	}
+
+	err = auth.OnBoardUser(req.Context(), user)
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+
 }

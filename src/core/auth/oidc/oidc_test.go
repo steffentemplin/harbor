@@ -2,12 +2,13 @@ package oidc
 
 import (
 	"context"
+	"github.com/goharbor/harbor/src/common"
+	"github.com/goharbor/harbor/src/common/models"
+	"github.com/goharbor/harbor/src/pkg/usergroup/model"
+	"github.com/goharbor/harbor/src/testing/controller/user"
+	"github.com/stretchr/testify/assert"
 	"os"
 	"testing"
-
-	"github.com/goharbor/harbor/src/common"
-	"github.com/goharbor/harbor/src/pkg/usergroup/model"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestMain(m *testing.M) {
@@ -30,4 +31,14 @@ func TestAuth_OnBoardGroup(t *testing.T) {
 	g2 := &model.UserGroup{GroupName: "group", GroupType: common.LDAPGroupType}
 	err2 := a.OnBoardGroup(context.TODO(), g2, "")
 	assert.NotNil(t, err2)
+}
+
+func TestAuth_OnBoardUser(t *testing.T) {
+	ctl := user.Controller{}
+	ctx := context.TODO()
+	a := Auth{userCtl: &ctl}
+	user := &models.User{UserID: 1}
+	ctl.Mock.On("OnboardOIDCUser", ctx, user).Return(nil)
+	err := a.OnBoardUser(ctx, user)
+	assert.Nil(t, err)
 }
