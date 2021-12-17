@@ -40,12 +40,48 @@ import (
 )
 
 const (
-	googleEndpoint  = "https://accounts.google.com"
-	OidcUserComment = "Onboarded via OIDC provider"
+	UserComment = "Onboarded via OIDC provider"
+
+	googleEndpoint = "https://accounts.google.com"
 )
 
 type claimsProvider interface {
+	GetIssuer() string
+	GetSubject() string
 	Claims(v interface{}) error
+}
+
+type idTokenWrapper struct {
+	*gooidc.IDToken
+}
+
+/*func (t *myIDToken) Claims(v interface{}) error {
+	return t.IDToken.Claims(v)
+}*/
+
+func (t *idTokenWrapper) GetIssuer() string {
+	return t.IDToken.Issuer
+}
+
+func (t *idTokenWrapper) GetSubject() string {
+	return t.IDToken.Subject
+}
+
+type userInfoWrapper struct {
+	*gooidc.UserInfo
+	Issuer string
+}
+
+/*func (m *myUserInfo) Claims(v interface{}) error {
+	return m.UserInfo.Claims(v)
+}*/
+
+func (m *userInfoWrapper) GetIssuer() string {
+	return m.Issuer
+}
+
+func (m *userInfoWrapper) GetSubject() string {
+	return m.UserInfo.Subject
 }
 
 type providerHelper struct {
@@ -128,14 +164,26 @@ type Token struct {
 // UserInfo wraps the information that is extracted via token.  It will be transformed to data object that is persisted
 // in the DB
 type UserInfo struct {
-	Issuer              string   `json:"iss"`
-	Subject             string   `json:"sub"`
-	Username            string   `json:"name"`
-	Email               string   `json:"email"`
-	Groups              []string `json:"groups"`
-	AdminGroupMember    bool     `json:"admin_group_member"`
-	autoOnboardUsername string
-	hasGroupClaim       bool
+	Issuer           string   `json:"iss"`
+	Subject          string   `json:"sub"`
+	Username         string   `json:"name"`
+	Email            string   `json:"email"`
+	Groups           []string `json:"groups"`
+	AdminGroupMember bool     `json:"admin_group_member"`
+}
+
+// userClaims collects the raw claims from ID tokens or user info responses. They serve as input for the final
+// UserInfo struct.
+type userClaims struct {
+	// Claim "email"
+	Email string
+	// Claim "name"
+	Name string
+	// Claim settings.UserClaim
+	Username string
+	// Claim setting.GroupsClaim
+	Groups    []string
+	HasGroups bool
 }
 
 func getOauthConf() (*oauth2.Config, error) {
@@ -197,18 +245,24 @@ func ExchangeToken(ctx context.Context, code string) (*Token, error) {
 	return &Token{Token: *oauthToken, RawIDToken: oauthToken.Extra("id_token").(string)}, nil
 }
 
-func parseIDToken(ctx context.Context, rawIDToken string) (*gooidc.IDToken, error) {
+func parseIDToken(ctx context.Context, rawIDToken string) *idTokenWrapper {
 	conf := &gooidc.Config{SkipClientIDCheck: true, SkipExpiryCheck: true}
-	return verifyTokenWithConfig(ctx, rawIDToken, conf)
+	token, err := verifyTokenWithConfig(ctx, rawIDToken, conf)
+	if err != nil {
+		log.Warningf("failed to parse ID token: %v", err)
+		return nil
+	}
+
+	return &idTokenWrapper{token}
 }
 
 // VerifyToken verifies the ID token based on the OIDC settings
 func VerifyToken(ctx context.Context, rawIDToken string) (*gooidc.IDToken, error) {
+	log.Debugf("Raw ID token for verification: %s", rawIDToken)
 	return verifyTokenWithConfig(ctx, rawIDToken, nil)
 }
 
 func verifyTokenWithConfig(ctx context.Context, rawIDToken string, conf *gooidc.Config) (*gooidc.IDToken, error) {
-	log.Debugf("Raw ID token for verification: %s", rawIDToken)
 	p, err := provider.get()
 	if err != nil {
 		return nil, err
@@ -259,144 +313,189 @@ func refreshToken(ctx context.Context, token *Token) (*Token, error) {
 // to generate a UserInfo object, if the ID token is not in the input token struct, some attributes will be empty
 func UserInfoFromToken(ctx context.Context, token *Token) (*UserInfo, error) {
 	// #10913: preload the configuration, in case it was not previously loaded by the UI
-	_, err := provider.get()
-	if err != nil {
-		return nil, err
-	}
-	setting := provider.setting.Load().(cfgModels.OIDCSetting)
-	local, err := UserInfoFromIDToken(ctx, token, setting)
-	if err != nil {
-		return nil, err
-	}
-	remote, err := userInfoFromRemote(ctx, token, setting)
-	if err != nil {
-		log.Warningf("Failed to get userInfo by calling remote userinfo endpoint, error: %v ", err)
-	}
-	if remote != nil && local != nil {
-		if remote.Subject != local.Subject {
-			return nil, fmt.Errorf("the subject from userinfo: %s does not match the subject from ID token: %s, probably a security attack happened", remote.Subject, local.Subject)
-		}
-		return mergeUserInfo(remote, local), nil
-	} else if remote != nil && local == nil {
-		return remote, nil
-	} else if local != nil && remote == nil {
-		log.Debugf("Fall back to user data from ID token.")
-		return local, nil
-	}
-	return nil, fmt.Errorf("failed to get userinfo from both remote and ID token")
-}
-
-func mergeUserInfo(remote, local *UserInfo) *UserInfo {
-	res := &UserInfo{
-		// data only contained in ID token
-		Subject: local.Subject,
-		Issuer:  local.Issuer,
-		// Used data from userinfo
-		Email: remote.Email,
-	}
-	// priority for username (high to low):
-	// 1. Username based on the auto onboard claim from ID token
-	// 2. Username from response of userinfo endpoint
-	// 3. Username from the default "name" claim from ID token
-	if local.autoOnboardUsername != "" {
-		res.Username = local.autoOnboardUsername
-	} else if remote.Username != "" {
-		res.Username = remote.Username
-	} else {
-		res.Username = local.Username
-	}
-	if remote.hasGroupClaim {
-		res.Groups = remote.Groups
-		res.AdminGroupMember = remote.AdminGroupMember
-		res.hasGroupClaim = true
-	} else if local.hasGroupClaim {
-		res.Groups = local.Groups
-		res.AdminGroupMember = local.AdminGroupMember
-		res.hasGroupClaim = true
-	} else {
-		res.Groups = []string{}
-	}
-	return res
-}
-
-func userInfoFromRemote(ctx context.Context, token *Token, setting cfgModels.OIDCSetting) (*UserInfo, error) {
 	p, err := provider.get()
 	if err != nil {
 		return nil, err
 	}
-	cctx := clientCtx(ctx, setting.VerifyCert)
-	u, err := p.UserInfo(cctx, oauth2.StaticTokenSource(&token.Token))
-	if err != nil {
-		return nil, err
+	setting := provider.setting.Load().(cfgModels.OIDCSetting)
+
+	var idToken *idTokenWrapper = nil
+	if token.RawIDToken != "" {
+		idToken = parseIDToken(ctx, token.RawIDToken)
 	}
-	return userInfoFromClaims(u, setting)
+
+	remoteUserInfo := loadUserInfo(ctx, token, p, setting)
+
+	if remoteUserInfo != nil && idToken != nil {
+		return mergeUserInfo(idToken, remoteUserInfo, setting)
+	} else if remoteUserInfo != nil && idToken == nil {
+		return userInfoFromProvider(remoteUserInfo, setting)
+	} else if idToken != nil && remoteUserInfo == nil {
+		log.Debugf("Fall back to user data from ID token.")
+		return userInfoFromProvider(idToken, setting)
+	}
+	return nil, fmt.Errorf("failed to get userinfo from both remote and ID token")
+}
+
+func loadUserInfo(ctx context.Context, token *Token, p *gooidc.Provider, setting cfgModels.OIDCSetting) *userInfoWrapper {
+	cctx := clientCtx(ctx, setting.VerifyCert)
+	remoteUserInfo, err := p.UserInfo(cctx, oauth2.StaticTokenSource(&token.Token))
+	if err != nil {
+		log.Warningf("Failed to get userInfo by calling remote userinfo endpoint, error: %v ", err)
+		return nil
+	}
+
+	return &userInfoWrapper{remoteUserInfo, setting.Endpoint}
 }
 
 // UserInfoFromIDToken extract user info from ID token
 func UserInfoFromIDToken(ctx context.Context, token *Token, setting cfgModels.OIDCSetting) (*UserInfo, error) {
 	if token.RawIDToken == "" {
-		return nil, nil
-	}
-	idt, err := parseIDToken(ctx, token.RawIDToken)
-	if err != nil {
-		return nil, err
+		return nil, errors.New("ID Token is not set")
 	}
 
-	u, err := userInfoFromClaims(idt, setting)
-	if err != nil {
-		return nil, err
+	idToken := parseIDToken(ctx, token.RawIDToken)
+	if idToken == nil {
+		return nil, errors.New("ID Token parsing failed")
 	}
 
-	// TODO: Test priorities
-	// priority for username (high to low):
-	// 1. Username based on the auto onboard claim from ID token
-	// (2. Username from response of userinfo endpoint) - does not apply here
-	// 3. Username from the default "name" claim from ID token
-	if u.autoOnboardUsername != "" {
-		u.Username = u.autoOnboardUsername
-	}
-
-	return u, nil
+	return userInfoFromProvider(idToken, setting)
 }
 
-func userInfoFromClaims(c claimsProvider, setting cfgModels.OIDCSetting) (*UserInfo, error) {
-	res := &UserInfo{}
-	if err := c.Claims(res); err != nil {
+func mergeUserInfo(idToken claimsProvider, userInfo claimsProvider, setting cfgModels.OIDCSetting) (*UserInfo, error) {
+	local, err := getUserClaimsFromProvider(idToken, setting)
+	if err != nil {
 		return nil, err
 	}
-	if setting.UserClaim != "" {
-		allClaims := make(map[string]interface{})
-		if err := c.Claims(&allClaims); err != nil {
-			return nil, err
-		}
 
-		if username, ok := allClaims[setting.UserClaim].(string); ok {
-			res.autoOnboardUsername = username
-		} else {
-			log.Warningf("OIDC. Failed to recover Username from claim. Claim '%s' is invalid or not a string", setting.UserClaim)
-		}
+	remote, err := getUserClaimsFromProvider(userInfo, setting)
+	if err != nil {
+		return nil, err
 	}
-	res.Groups, res.hasGroupClaim = groupsFromClaims(c, setting.GroupsClaim)
+
+	if userInfo.GetSubject() != idToken.GetSubject() {
+		return nil, fmt.Errorf("the subject from userinfo: %s does not match the subject from ID token: %s, "+
+			"probably a security attack happened", userInfo.GetSubject(), idToken.GetSubject())
+	}
+
+	res := &UserInfo{
+		Subject: idToken.GetSubject(),
+		Issuer:  idToken.GetIssuer(),
+	}
+
+	res.Email = remote.Email
+	if res.Email == "" {
+		res.Email = local.Email
+	}
+
+	// priority for username (high to low):
+	// 1. Username based on the auto onboard claim from ID token
+	// 2. Username from response of userinfo endpoint
+	// 3. Username from the default "name" claim from response of userinfo endpoint
+	// 4. Username from the default "name" claim from ID token
+	if local.Username != "" {
+		res.Username = sanitizeUserName(local.Username)
+	} else if remote.Username != "" {
+		res.Username = sanitizeUserName(remote.Username)
+	} else if remote.Name != "" {
+		res.Username = sanitizeUserName(remote.Name)
+	} else {
+		res.Username = sanitizeUserName(local.Name)
+	}
+
+	if remote.HasGroups {
+		res.Groups = remote.Groups
+		res.AdminGroupMember = isInAdminGroup(remote.Groups, setting)
+	} else if local.HasGroups {
+		res.Groups = local.Groups
+		res.AdminGroupMember = isInAdminGroup(local.Groups, setting)
+	} else {
+		res.Groups = []string{}
+	}
+
+	return res, nil
+}
+
+func userInfoFromProvider(p claimsProvider, setting cfgModels.OIDCSetting) (*UserInfo, error) {
+	claims, err := getUserClaimsFromProvider(p, setting)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &UserInfo{
+		Subject: p.GetSubject(),
+		Issuer:  p.GetIssuer(),
+	}
+
+	res.Email = claims.Email
+	if claims.Username != "" {
+		res.Username = sanitizeUserName(claims.Username)
+	} else {
+		res.Username = sanitizeUserName(claims.Name)
+	}
+
+	if len(claims.Groups) > 0 {
+		res.Groups = claims.Groups
+		res.AdminGroupMember = isInAdminGroup(claims.Groups, setting)
+	}
+
+	return res, nil
+}
+
+func isInAdminGroup(groups []string, setting cfgModels.OIDCSetting) bool {
 	if len(setting.AdminGroup) > 0 {
-		for _, g := range res.Groups {
+		for _, g := range groups {
 			if g == setting.AdminGroup {
-				res.AdminGroupMember = true
-				break
+				return true
 			}
 		}
 	}
-	return res, nil
+
+	return false
+}
+
+func getUserClaimsFromProvider(p claimsProvider, setting cfgModels.OIDCSetting) (*userClaims, error) {
+	var allClaims map[string]interface{}
+	err := p.Claims(&allClaims)
+	if err != nil {
+		return nil, err
+	}
+
+	claims := &userClaims{}
+	if val, ok := allClaims["name"]; ok {
+		claims.Name, _ = val.(string)
+	}
+
+	if val, ok := allClaims["email"]; ok {
+		claims.Email, _ = val.(string)
+	}
+
+	if setting.UserClaim != "" {
+		if val, ok := allClaims[setting.UserClaim]; ok {
+			claims.Username, _ = val.(string)
+		}
+	}
+
+	claims.Groups, claims.HasGroups = groupsFromClaimMap(allClaims, setting.GroupsClaim)
+	return claims, nil
 }
 
 // groupsFromClaims fetches the group name list from claimprovider, such as decoded ID token.
 // If the claims does not have the claim defined as k, the second return value will be false, otherwise true
 func groupsFromClaims(gp claimsProvider, k string) ([]string, bool) {
-	res := make([]string, 0)
 	claimMap := make(map[string]interface{})
 	if err := gp.Claims(&claimMap); err != nil {
 		log.Errorf("failed to fetch claims, error: %v", err)
-		return res, false
+		return make([]string, 0), false
 	}
+
+	return groupsFromClaimMap(claimMap, k)
+}
+
+// groupsFromClaims fetches the group name list from claim map, such as decoded ID token.
+// If the claims does not have the claim defined as k, the second return value will be false, otherwise true
+func groupsFromClaimMap(claimMap map[string]interface{}, k string) ([]string, bool) {
+	res := make([]string, 0)
 	g, ok := claimMap[k].([]interface{})
 	if !ok {
 		if len(strings.TrimSpace(k)) > 0 {
@@ -477,12 +576,9 @@ func SecretAndToken(tokenBytes []byte) (string, string, error) {
 	return secret, token, nil
 }
 
-// GetSanitizedUserName replaces illegal characters of info.Username and returns
+// sanitizeUserName replaces illegal characters of info.Username and returns
 // the sanitized string
-func GetSanitizedUserName(info *UserInfo) string {
-	// Recover the username from d.Username by default
-	username := info.Username
+func sanitizeUserName(username string) string {
 	// Fix blanks in username
-	username = strings.Replace(username, " ", "_", -1)
-	return username
+	return strings.Replace(username, " ", "_", -1)
 }

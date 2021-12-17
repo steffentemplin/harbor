@@ -116,7 +116,6 @@ func (oc *OIDCController) Callback() {
 	u, err := ctluser.Ctl.GetBySubIss(ctx, info.Subject, info.Issuer)
 	if errors.IsNotFoundErr(err) { // User is not onboarded, kickoff the onboard flow
 		// Recover the username from d.Username by default
-		username := oidc.GetSanitizedUserName(info)
 		oidcSettings, err := config.OIDCSetting(ctx)
 		if err != nil {
 			oc.SendInternalServerError(err)
@@ -125,12 +124,12 @@ func (oc *OIDCController) Callback() {
 		// If automatic onboard is enabled, skip the onboard page
 		if oidcSettings.AutoOnboard {
 			log.Debug("Doing automatic onboarding\n")
-			if username == "" {
+			if info.Username == "" {
 				oc.SendInternalServerError(fmt.Errorf("unable to recover username for auto onboard, username claim: %s",
 					oidcSettings.UserClaim))
 				return
 			}
-			userRec, onboarded := userOnboard(ctx, oc, info, username, tokenBytes)
+			userRec, onboarded := userOnboard(ctx, oc, info, info.Username, tokenBytes)
 			if onboarded == false {
 				log.Error("User not onboarded\n")
 				return
@@ -139,7 +138,7 @@ func (oc *OIDCController) Callback() {
 			u = userRec
 		} else {
 			oc.SetSession(userInfoKey, string(ouDataStr))
-			oc.Controller.Redirect(fmt.Sprintf("/oidc-onboard?username=%s", username), http.StatusFound)
+			oc.Controller.Redirect(fmt.Sprintf("/oidc-onboard?username=%s", info.Username), http.StatusFound)
 			// Once redirected, no further actions are done
 			return
 		}
@@ -182,7 +181,7 @@ func userOnboard(ctx context.Context, oc *OIDCController, info *oidc.UserInfo, u
 		Realname:     username,
 		Email:        info.Email,
 		OIDCUserMeta: &oidcUser,
-		Comment:      oidc.OidcUserComment,
+		Comment:      oidc.UserComment,
 	}
 	oidc.InjectGroupsToUser(info, user)
 

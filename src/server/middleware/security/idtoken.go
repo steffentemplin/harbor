@@ -89,22 +89,21 @@ func (i *idToken) Generate(req *http.Request) security.Context {
 }
 
 func autoOnboard(req *http.Request, setting *cfgModels.OIDCSetting, info *oidc.UserInfo, idToken string) (*models.User, error) {
-	username := oidc.GetSanitizedUserName(info)
-	if username == "" {
-		return nil, fmt.Errorf("unable to recover username for auto onboard, username claim: %s", setting.UserClaim)
+	if info.Username == "" {
+		return nil, fmt.Errorf("unable to get username for auto onboard from ID Token, username claim: %s", setting.UserClaim)
 	}
 
-	log.Infof("starting auto-onboarding for new OIDC user %s for valid ID token", username)
+	log.Infof("starting auto-onboarding for new OIDC user %s for valid ID token", info.Username)
 
 	token := &oidc.Token{RawIDToken: idToken}
 	tokenBytes, err := json.Marshal(token)
 	if err != nil {
-		return nil, fmt.Errorf("unable to marshal ID token for user: %s", username)
+		return nil, fmt.Errorf("unable to marshal ID token for user: %s", info.Username)
 	}
 
 	s, t, err := oidc.SecretAndToken(tokenBytes)
 	if err != nil {
-		return nil, fmt.Errorf("unable to encrypt secret and token for: %s", username)
+		return nil, fmt.Errorf("unable to encrypt secret and token for: %s", info.Username)
 	}
 
 	oidcUser := models.OIDCUser{
@@ -114,11 +113,11 @@ func autoOnboard(req *http.Request, setting *cfgModels.OIDCSetting, info *oidc.U
 	}
 
 	user := &models.User{
-		Username:     username,
-		Realname:     username,
+		Username:     info.Username,
+		Realname:     info.Username,
 		Email:        info.Email,
 		OIDCUserMeta: &oidcUser,
-		Comment:      oidc.OidcUserComment,
+		Comment:      oidc.UserComment,
 	}
 
 	err = auth.OnBoardUser(req.Context(), user)

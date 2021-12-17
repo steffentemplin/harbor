@@ -145,6 +145,14 @@ func (fc *fakeClaims) Claims(n interface{}) error {
 	return json.Unmarshal(b, n)
 }
 
+func (fc *fakeClaims) GetIssuer() string {
+	return fc.claims["iss"].(string)
+}
+
+func (fc *fakeClaims) GetSubject() string {
+	return fc.claims["sub"].(string)
+}
+
 func TestGroupsFromClaim(t *testing.T) {
 	in := map[string]interface{}{
 		"user":     "user1",
@@ -196,7 +204,7 @@ func TestUserInfoFromClaims(t *testing.T) {
 	s := []struct {
 		input   map[string]interface{}
 		setting cfgModels.OIDCSetting
-		expect  *UserInfo
+		expect  *userClaims
 	}{
 		{
 			input: map[string]interface{}{
@@ -210,14 +218,11 @@ func TestUserInfoFromClaims(t *testing.T) {
 				UserClaim:   "",
 				AdminGroup:  "g1",
 			},
-			expect: &UserInfo{
-				Issuer:              "",
-				Subject:             "",
-				autoOnboardUsername: "",
-				Username:            "Daniel",
-				Email:               "daniel@gmail.com",
-				Groups:              []string{},
-				hasGroupClaim:       false,
+			expect: &userClaims{
+				Name:      "Daniel",
+				Email:     "daniel@gmail.com",
+				Groups:    []string{},
+				HasGroups: false,
 			},
 		},
 		{
@@ -232,15 +237,11 @@ func TestUserInfoFromClaims(t *testing.T) {
 				UserClaim:   "",
 				AdminGroup:  "g1",
 			},
-			expect: &UserInfo{
-				Issuer:              "",
-				Subject:             "",
-				autoOnboardUsername: "",
-				Username:            "Daniel",
-				Email:               "daniel@gmail.com",
-				Groups:              []string{"g1", "g2"},
-				AdminGroupMember:    true,
-				hasGroupClaim:       true,
+			expect: &userClaims{
+				Name:      "Daniel",
+				Email:     "daniel@gmail.com",
+				Groups:    []string{"g1", "g2"},
+				HasGroups: true,
 			},
 		},
 		{
@@ -257,15 +258,11 @@ func TestUserInfoFromClaims(t *testing.T) {
 				UserClaim:   "",
 				AdminGroup:  "g1",
 			},
-			expect: &UserInfo{
-				Issuer:              "issuer",
-				Subject:             "subject000",
-				autoOnboardUsername: "",
-				Username:            "jack",
-				Email:               "jack@gmail.com",
-				Groups:              []string{},
-				hasGroupClaim:       true,
-				AdminGroupMember:    false,
+			expect: &userClaims{
+				Name:      "jack",
+				Email:     "jack@gmail.com",
+				Groups:    []string{},
+				HasGroups: true,
 			},
 		},
 		{
@@ -280,176 +277,151 @@ func TestUserInfoFromClaims(t *testing.T) {
 				UserClaim:   "email",
 				AdminGroup:  "g1",
 			},
-			expect: &UserInfo{
-				Issuer:              "",
-				Subject:             "",
-				autoOnboardUsername: "airadier@gmail.com",
-				Username:            "Alvaro",
-				Email:               "airadier@gmail.com",
-				Groups:              []string{},
-				hasGroupClaim:       false,
-				AdminGroupMember:    false,
+			expect: &userClaims{
+				Name:      "Alvaro",
+				Username:  "airadier@gmail.com",
+				Email:     "airadier@gmail.com",
+				Groups:    []string{},
+				HasGroups: false,
 			},
 		},
 	}
 	for _, tc := range s {
-		out, err := userInfoFromClaims(&fakeClaims{tc.input}, tc.setting)
+		out, err := getUserClaimsFromProvider(&fakeClaims{tc.input}, tc.setting)
 		assert.Nil(t, err)
 		assert.Equal(t, *tc.expect, *out)
 	}
 }
 
 func TestMergeUserInfo(t *testing.T) {
+	setting := cfgModels.OIDCSetting{
+		UserClaim:   "username",
+		GroupsClaim: "groups",
+	}
 	s := []struct {
-		fromInfo    *UserInfo
-		fromIDToken *UserInfo
+		fromInfo    map[string]interface{}
+		fromIDToken map[string]interface{}
 		expected    *UserInfo
 	}{
 		{
-			fromInfo: &UserInfo{
-				Issuer:              "",
-				Subject:             "",
-				autoOnboardUsername: "",
-				Username:            "daniel",
-				Email:               "daniel@gmail.com",
-				Groups:              []string{},
-				hasGroupClaim:       false,
+			fromInfo: map[string]interface{}{
+				"iss":   "issuer-google",
+				"sub":   "subject-daniel",
+				"name":  "daniel",
+				"email": "daniel@gmail.com",
 			},
-			fromIDToken: &UserInfo{
-				Issuer:              "issuer-google",
-				Subject:             "subject-daniel",
-				autoOnboardUsername: "",
-				Username:            "daniel",
-				Email:               "daniel@yahoo.com",
-				Groups:              []string{"developers", "everyone"},
-				hasGroupClaim:       true,
+			fromIDToken: map[string]interface{}{
+				"iss":    "issuer-google",
+				"sub":    "subject-daniel",
+				"name":   "daniel",
+				"email":  "daniel@yahoo.com",
+				"groups": []string{"developers", "everyone"},
 			},
 			expected: &UserInfo{
-				Issuer:        "issuer-google",
-				Subject:       "subject-daniel",
-				Username:      "daniel",
-				Email:         "daniel@gmail.com",
-				Groups:        []string{"developers", "everyone"},
-				hasGroupClaim: true,
+				Issuer:   "issuer-google",
+				Subject:  "subject-daniel",
+				Username: "daniel",
+				Email:    "daniel@gmail.com",
+				Groups:   []string{"developers", "everyone"},
 			},
 		},
 		{
-			fromInfo: &UserInfo{
-				Issuer:              "",
-				Subject:             "",
-				autoOnboardUsername: "",
-				Username:            "tom",
-				Email:               "tom@gmail.com",
-				Groups:              nil,
-				hasGroupClaim:       false,
+			fromInfo: map[string]interface{}{
+				"iss":    "issuer-okta",
+				"sub":    "subject-jiangtan",
+				"name":   "tom",
+				"email":  "tom@gmail.com",
+				"groups": nil,
 			},
-			fromIDToken: &UserInfo{
-				Issuer:              "issuer-okta",
-				Subject:             "subject-jiangtan",
-				autoOnboardUsername: "",
-				Username:            "tom",
-				Email:               "tom@okta.com",
-				Groups:              []string{"nouse"},
-				hasGroupClaim:       false,
+			fromIDToken: map[string]interface{}{
+				"iss":            "issuer-okta",
+				"sub":            "subject-jiangtan",
+				"name":           "tom",
+				"email":          "tom@okta.com",
+				"groups_noexist": []string{"nouse"},
 			},
 			expected: &UserInfo{
-				Issuer:        "issuer-okta",
-				Subject:       "subject-jiangtan",
-				Username:      "tom",
-				Email:         "tom@gmail.com",
-				Groups:        []string{},
-				hasGroupClaim: false,
+				Issuer:   "issuer-okta",
+				Subject:  "subject-jiangtan",
+				Username: "tom",
+				Email:    "tom@gmail.com",
+				Groups:   []string{},
 			},
 		},
 		{
-			fromInfo: &UserInfo{
-				Issuer:              "",
-				Subject:             "",
-				autoOnboardUsername: "",
-				Username:            "jim",
-				Email:               "jim@gmail.com",
-				Groups:              []string{},
-				hasGroupClaim:       true,
+			fromInfo: map[string]interface{}{
+				"iss":    "issuer-yahoo",
+				"sub":    "subject-jim",
+				"name":   "jim",
+				"email":  "jim@gmail.com",
+				"groups": []string{},
 			},
-			fromIDToken: &UserInfo{
-				Issuer:              "issuer-yahoo",
-				Subject:             "subject-jim",
-				autoOnboardUsername: "",
-				Username:            "jim",
-				Email:               "jim@yaoo.com",
-				Groups:              []string{"g1", "g2"},
-				hasGroupClaim:       true,
+			fromIDToken: map[string]interface{}{
+				"iss":    "issuer-yahoo",
+				"sub":    "subject-jim",
+				"name":   "jim",
+				"email":  "jim@yaoo.com",
+				"groups": []string{"g1", "g2"},
 			},
 			expected: &UserInfo{
-				Issuer:        "issuer-yahoo",
-				Subject:       "subject-jim",
-				Username:      "jim",
-				Email:         "jim@gmail.com",
-				Groups:        []string{},
-				hasGroupClaim: true,
+				Issuer:   "issuer-yahoo",
+				Subject:  "subject-jim",
+				Username: "jim",
+				Email:    "jim@gmail.com",
+				Groups:   []string{},
 			},
 		},
 		{
-			fromInfo: &UserInfo{
-				Issuer:              "",
-				Subject:             "",
-				autoOnboardUsername: "",
-				Username:            "",
-				Email:               "kevin@whatever.com",
-				Groups:              []string{},
-				hasGroupClaim:       false,
+			fromInfo: map[string]interface{}{
+				"iss":   "issuer-whatever",
+				"sub":   "subject-kevin",
+				"name":  "",
+				"email": "kevin@whatever.com",
 			},
-			fromIDToken: &UserInfo{
-				Issuer:              "issuer-whatever",
-				Subject:             "subject-kevin",
-				autoOnboardUsername: "",
-				Username:            "kevin",
-				Email:               "kevin@whatever.com",
-				Groups:              []string{"g1", "g2"},
-				hasGroupClaim:       true,
+			fromIDToken: map[string]interface{}{
+				"iss":    "issuer-whatever",
+				"sub":    "subject-kevin",
+				"name":   "kevin",
+				"email":  "kevin@whatever.com",
+				"groups": []string{"g1", "g2"},
 			},
 			expected: &UserInfo{
-				Issuer:        "issuer-whatever",
-				Subject:       "subject-kevin",
-				Username:      "kevin",
-				Email:         "kevin@whatever.com",
-				Groups:        []string{"g1", "g2"},
-				hasGroupClaim: true,
+				Issuer:   "issuer-whatever",
+				Subject:  "subject-kevin",
+				Username: "kevin",
+				Email:    "kevin@whatever.com",
+				Groups:   []string{"g1", "g2"},
 			},
 		},
 		{
-			fromInfo: &UserInfo{
-				Issuer:  "",
-				Subject: "",
-				// only the auto onboard username from token will be used
-				autoOnboardUsername: "info-jt",
-				Username:            "",
-				Email:               "jt@whatever.com",
-				Groups:              []string{},
-				hasGroupClaim:       false,
+			fromInfo: map[string]interface{}{
+				"iss":      "issuer-whatever",
+				"sub":      "subject-jt",
+				"name":     "",
+				"username": "info-jt",
+				"email":    "jt@whatever.com",
 			},
-			fromIDToken: &UserInfo{
-				Issuer:              "issuer-whatever",
-				Subject:             "subject-jt",
-				autoOnboardUsername: "token-jt",
-				Username:            "jt",
-				Email:               "jt@whatever.com",
-				Groups:              []string{"g1", "g2"},
-				hasGroupClaim:       true,
+			fromIDToken: map[string]interface{}{
+				"iss":      "issuer-whatever",
+				"sub":      "subject-jt",
+				"name":     "jt",
+				"username": "token-jt",
+				"email":    "jt@whatever.com",
+				"groups":   []string{"g1", "g2"},
 			},
 			expected: &UserInfo{
-				Issuer:        "issuer-whatever",
-				Subject:       "subject-jt",
-				Username:      "token-jt",
-				Email:         "jt@whatever.com",
-				Groups:        []string{"g1", "g2"},
-				hasGroupClaim: true,
+				Issuer:   "issuer-whatever",
+				Subject:  "subject-jt",
+				Username: "token-jt",
+				Email:    "jt@whatever.com",
+				Groups:   []string{"g1", "g2"},
 			},
 		},
 	}
 
 	for _, tc := range s {
-		m := mergeUserInfo(tc.fromInfo, tc.fromIDToken)
+		m, err := mergeUserInfo(&fakeClaims{tc.fromIDToken}, &fakeClaims{tc.fromInfo}, setting)
+		assert.Nil(t, err)
 		assert.Equal(t, *tc.expected, *m)
 	}
 }
@@ -467,7 +439,6 @@ func TestInjectGroupsToUser(t *testing.T) {
 				Username:         "jim",
 				Email:            "jim@gmail.com",
 				Groups:           []string{},
-				hasGroupClaim:    true,
 				AdminGroupMember: false,
 			},
 			old: &models.User{
@@ -490,7 +461,6 @@ func TestInjectGroupsToUser(t *testing.T) {
 				Username:         "jim",
 				Email:            "jim@gmail.com",
 				Groups:           []string{"1", "abc"},
-				hasGroupClaim:    true,
 				AdminGroupMember: true,
 			},
 			old: &models.User{
@@ -513,7 +483,6 @@ func TestInjectGroupsToUser(t *testing.T) {
 				Username:         "jim",
 				Email:            "jim@gmail.com",
 				Groups:           []string{"1", "2"},
-				hasGroupClaim:    true,
 				AdminGroupMember: true,
 			},
 			old: &models.User{
